@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "${workspaceFolder}/.venv/bin/python3.12",
+            "env": {
+                "PYDEVD_WARN_EVALUATION_TIMEOUT": "10",
+                "PYDEVD_UNBLOCK_THREADS_TIMEOUT": "10"
+            }
+        }
+    ]
+}

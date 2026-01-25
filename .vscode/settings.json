@@ -1,0 +1,11 @@
+{
+  "window.zoomLevel": 1,
+  "editor.fontSize": 16,
+  "terminal.integrated.fontSize": 16,
+  "python.defaultInterpreterPath": "./.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "editor.wordWrap": "on",
+  "terminal.integrated.env.linux": {
+    "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}"
+  }
+}
