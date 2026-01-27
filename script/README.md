@@ -1,0 +1,2 @@
+## 20260127 08:31
+/home/data1/musong/workspace/python/spen_recons/script/0127_ddpm_brain.py这个是从https://github.com/huggingface/diffusers/blob/main/docs/source/en/training/unconditional_training.md来的，删了版本号，改了通道和L
