@@ -1,7 +1,7 @@
 {
-  "window.zoomLevel": 1,
-  "editor.fontSize": 16,
-  "terminal.integrated.fontSize": 16,
+  "window.zoomLevel": 2,
+  "editor.fontSize": 20,
+  "terminal.integrated.fontSize": 20,
   "python.defaultInterpreterPath": "./.venv/bin/python",
   "python.terminal.activateEnvironment": true,
   "editor.wordWrap": "on",
