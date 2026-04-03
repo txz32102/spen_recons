@@ -1,18 +1,14 @@
-Please help me write the python code
-
-code1:
-```python
 """ 
 cd /home/data1/musong/workspace/python/spen_recons
 source .venv/bin/activate
 export PYTHONPATH=$PYTHONPATH:.
-CUDA_VISIBLE_DEVICES=3 python3 script/0402_spen_matrix_recons.py
+CUDA_VISIBLE_DEVICES=2 python3 script/0403_unrolling.py
 """
 
 """
-This project implements an end-to-end deep learning pipeline for image reconstruction. A lightweight UNet architecture is trained to recover high-resolution ground truth images from degraded inputs. 
-Degradation is applied via fixed AFinal and InvA matrices to simulate acquisition artifacts, with random noise injected into the high-resolution data prior to degradation. 
-The network maps the absolute value of the artifact-heavy corrected data (corr_data) back to the clean ground truth.
+This project implements an end-to-end deep learning pipeline for image reconstruction. 
+It uses an Unrolled ADMM architecture, combining a lightweight UNet (for regularization/denoising) 
+with data consistency layers to recover high-resolution ground truth images from degraded inputs. 
 """
 
 import os
@@ -54,9 +50,9 @@ def set_seed(seed=42):
 # 1. Argument Parser
 # ==========================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="SPEN Matrix Reconstruction Training Pipeline")
+    parser = argparse.ArgumentParser(description="SPEN Matrix Reconstruction - Unrolled ADMM")
     
-    parser.add_argument("--exp_name", type=str, default="spen_matrix_recons", 
+    parser.add_argument("--exp_name", type=str, default="spen_matrix_recons_admm", 
                         help="Name of the experiment for logging purposes")
     parser.add_argument("--log_dir", type=str, default="log", 
                         help="Base directory for saving logs and images")
@@ -69,11 +65,13 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4, 
                         help="Learning rate for the optimizer")
     parser.add_argument("--train_ratio", type=float, default=0.8, 
-                        help="Ratio of the dataset to use for training (e.g., 0.8 for 80%)")
+                        help="Ratio of the dataset to use for training")
     parser.add_argument("--noise_min", type=float, default=0.0, 
                         help="Minimum noise level to inject into HR images")
     parser.add_argument("--noise_max", type=float, default=0.02, 
                         help="Maximum noise level to inject into HR images")
+    parser.add_argument("--admm_iters", type=int, default=3, 
+                        help="Number of unrolled ADMM iterations")
     parser.add_argument("--seed", type=int, default=42, 
                         help="Random seed for reproducibility")
     
@@ -98,10 +96,10 @@ class SPENDataset(Dataset):
         return gt_tensor
 
 # ==========================================
-# 3. Simple Reconstruction Model (UNet)
+# 3. Models (UNet + Unrolled ADMM)
 # ==========================================
 class SimpleUNet(nn.Module):
-    """A standard, deeper UNet for 96x96 image reconstruction."""
+    """A standard UNet acting as the learned regularizer (Z-update)."""
     def __init__(self):
         super(SimpleUNet, self).__init__()
         
@@ -117,15 +115,12 @@ class SimpleUNet(nn.Module):
         
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Encoder (Downsampling)
-        self.enc1 = conv_block(1, 64)       # Input: 96x96
-        self.enc2 = conv_block(64, 128)     # Input: 48x48
-        self.enc3 = conv_block(128, 256)    # Input: 24x24
+        self.enc1 = conv_block(1, 64)       
+        self.enc2 = conv_block(64, 128)     
+        self.enc3 = conv_block(128, 256)    
 
-        # Bottleneck
-        self.bottleneck = conv_block(256, 512) # Input: 12x12
+        self.bottleneck = conv_block(256, 512) 
 
-        # Decoder (Upsampling)
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.dec3 = conv_block(512 + 256, 256)
 
@@ -135,7 +130,6 @@ class SimpleUNet(nn.Module):
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.dec1 = conv_block(128 + 64, 64)
 
-        # Final projection
         self.final = nn.Conv2d(64, 1, kernel_size=1)
 
     def forward(self, x):
@@ -151,14 +145,72 @@ class SimpleUNet(nn.Module):
 
         return torch.sigmoid(self.final(d1))
 
+class DataConsistencyLayer(nn.Module):
+    """
+    Forces the network's prediction to remain faithful to the measured physics.
+    Takes a gradient descent step using the forward operator AFinal and inverse InvA.
+    """
+    def __init__(self):
+        super(DataConsistencyLayer, self).__init__()
+        self.alpha = nn.Parameter(torch.tensor(0.1)) # Learnable step size
+        
+    def forward(self, x, y, AFinal, InvA, rho, z_minus_u):
+        complex_x = x.squeeze(1).to(dtype=torch.complex64) * 1j
+        
+        # Forward process: Ax
+        Ax = torch.matmul(AFinal, complex_x)
+        
+        # Error in measurement space: Ax - y
+        error = Ax - y
+        
+        # Map error back to image space: A^H(Ax - y)
+        grad_physics = torch.matmul(InvA, error).abs().unsqueeze(1)
+        
+        # ADMM penalty gradient
+        grad_admm = rho * (x - z_minus_u)
+        
+        # Gradient Descent Step
+        x_new = x - self.alpha * (grad_physics + grad_admm)
+        return x_new
+
+class UnrolledADMM(nn.Module):
+    """Unrolls the ADMM optimization algorithm into a trainable neural network."""
+    def __init__(self, num_iterations=3):
+        super(UnrolledADMM, self).__init__()
+        self.num_iterations = num_iterations
+        
+        # Shared UNet prior across iterations to save memory
+        self.unet = SimpleUNet() 
+        self.rho = nn.Parameter(torch.tensor(0.05)) # Learnable penalty parameter
+        self.dc_layers = nn.ModuleList([DataConsistencyLayer() for _ in range(num_iterations)])
+
+    def forward(self, y_meas, rough_input, AFinal, InvA):
+        x = rough_input
+        u = torch.zeros_like(x)
+        
+        for i in range(self.num_iterations):
+            # 1. Z-Update (Neural Network Denoising)
+            z_input = x + u
+            # Normalize to [0,1] range expected by Sigmoid at end of UNet
+            z_input_norm = (z_input - z_input.min()) / (z_input.max() - z_input.min() + 1e-8)
+            z = self.unet(z_input_norm) 
+            
+            # 2. X-Update (Data Consistency)
+            z_minus_u = z - u
+            x = self.dc_layers[i](x, y_meas, AFinal, InvA, self.rho, z_minus_u)
+            
+            # 3. U-Update (Dual Variable Update)
+            u = u + (x - z)
+            
+        # Optional: final normalization to ensure outputs are bounded [0,1] for loss/viz
+        x_out = (x - x.min()) / (x.max() - x.min() + 1e-8)
+        return x_out
+
 # ==========================================
 # 4. Provided Visualization Function
 # ==========================================
 def plot_training_progress(inputs, finals, gts, input_psnrs, input_ssims, final_psnrs, final_ssims, save_path):
-    """
-    Creates a 3-row grid for visualizing training progress.
-    Rows: Input (Degraded) | Recons (Final) | GT
-    """
+    import matplotlib.pyplot as plt # Ensure standard pyplot is used here
     cols = len(inputs)
     total_rows = 3 
     
@@ -240,7 +292,6 @@ def train(args):
     logging.info("Pre-computing InvA and AFinal matrices...")
     InvA, AFinal = spen(acq_point=(96, 96)).get_InvA()
     
-    # Ensure matrices are complex tensors and moved to the correct device
     if not isinstance(InvA, torch.Tensor):
         InvA = torch.tensor(InvA)
     if not isinstance(AFinal, torch.Tensor):
@@ -250,7 +301,8 @@ def train(args):
     AFinal = AFinal.to(dtype=torch.complex64, device=device)
 
     # --- 3. Model & Optimizer ---
-    model = SimpleUNet().to(device)
+    # NEW: Initialize the Unrolled ADMM Model instead of just SimpleUNet
+    model = UnrolledADMM(num_iterations=args.admm_iters).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.L1Loss() 
     
@@ -262,29 +314,26 @@ def train(args):
         epoch_loss = 0.0
         
         for gts in train_loader:
-            gts = gts.to(device) # Shape: (B, 1, 96, 96)
+            gts = gts.to(device) 
             
             with torch.no_grad():
-                # 1. Inject Noise into High-Resolution Image BEFORE degradation
                 noise_lvl = random.uniform(args.noise_min, args.noise_max)
                 noise = torch.randn_like(gts) * noise_lvl
                 noisy_gts = gts + noise
                 
-                # Squeeze to shape (B, 96, 96) for matrix operations and convert to complex
                 complex_img = noisy_gts.squeeze(1).to(dtype=torch.complex64) * 1j
                 
-                # 2. Apply Degradation and Correction Matrices
+                # y_meas (degraded_data) is kept to pass into the ADMM network
                 degraded_data = torch.matmul(AFinal, complex_img)
                 corr_data = torch.matmul(InvA, degraded_data)
                 
-                # 3. Extract magnitude (abs) and restore channel dimension -> (B, 1, 96, 96)
                 rough = corr_data.abs().unsqueeze(1)
-                
-                # Normalize rough input to [0,1] for stable neural network training
                 rough = (rough - rough.min()) / (rough.max() - rough.min() + 1e-8)
 
             optimizer.zero_grad()
-            recons = model(rough)
+            
+            # NEW: Pass both measurements and matrices to the unrolled network
+            recons = model(y_meas=degraded_data, rough_input=rough, AFinal=AFinal, InvA=InvA)
             
             loss = criterion(recons, gts)
             loss.backward()
@@ -300,15 +349,12 @@ def train(args):
         val_psnrs, val_ssims = [], []
         
         first_batch = True 
-        
-        # Fixed noise for consistent validation tracking
         val_noise_lvl = (args.noise_min + args.noise_max) / 2.0
         
         with torch.no_grad():
             for gts in val_loader:
                 gts = gts.to(device)
                 
-                # Apply same pipeline with fixed validation noise
                 noise = torch.randn_like(gts) * val_noise_lvl
                 noisy_gts = gts + noise
                 
@@ -319,7 +365,9 @@ def train(args):
                 rough = corr_data.abs().unsqueeze(1)
                 rough = (rough - rough.min()) / (rough.max() - rough.min() + 1e-8)
                 
-                recons = model(rough)
+                # NEW: Pass both measurements and matrices to the unrolled network
+                recons = model(y_meas=degraded_data, rough_input=rough, AFinal=AFinal, InvA=InvA)
+                
                 val_loss += criterion(recons, gts).item()
                 
                 gts_np = gts.cpu().numpy().squeeze(1)     
@@ -394,195 +442,3 @@ def train(args):
 if __name__ == "__main__":
     args = parse_args()
     train(args)
-```
-
-code2:
-```python
-""" 
-cd /home/data1/musong/workspace/python/spen_recons
-source .venv/bin/activate
-export PYTHONPATH=$PYTHONPATH:.
-CUDA_VISIBLE_DEVICES=3 python3 script/0326_end_to_end_scanner_test.py
-"""
-
-"""
-This project evaluates a supervised deep learning pipeline for high-resolution SPEN (Spatiotemporal Encoding) image reconstruction using real-world scanner data. A lightweight SimpleUNet architecture, previously trained on simulated degraded images with dynamic noise injection, is deployed to reconstruct 96x96 rat brain images from raw .mat scanner files. The script automates the transition from complex-valued scanner input to normalized magnitude images, applying orientation corrections to ensure consistency with the training distribution. Performance is visually validated through a multi-row grid comparison against traditional MATLAB reconstructions, demonstrating the model's ability to suppress artifacts and recover structural details on unseen, physical acquisition data.
-"""
-import argparse
-import os
-import glob
-import re
-import math
-from pathlib import Path
-from datetime import datetime
-
-import scipy.io
-import numpy as np
-import matplotlib.pyplot as plt
-
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import save_image
-
-# ==========================================
-# 1. Model Architecture (Must match 0325_end_to_end.py)
-# ==========================================
-class SimpleUNet(nn.Module):
-    def __init__(self):
-        super(SimpleUNet, self).__init__()
-        def conv_block(in_c, out_c):
-            return nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_c, out_c, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(inplace=True)
-            )
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.enc1 = conv_block(1, 64)
-        self.enc2 = conv_block(64, 128)
-        self.enc3 = conv_block(128, 256)
-        self.bottleneck = conv_block(256, 512)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec3 = conv_block(512 + 256, 256)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec2 = conv_block(256 + 128, 128)
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec1 = conv_block(128 + 64, 64)
-        self.final = nn.Conv2d(64, 1, kernel_size=1)
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        b = self.bottleneck(self.pool(e3))
-        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return torch.sigmoid(self.final(d1))
-
-# ==========================================
-# 2. Plotting Utility (Original 5xN Style)
-# ==========================================
-def plot_comparison_5xn(inputs, trad_recons, dl_recons, slice_nums, save_path, slice_gap=4):
-    inputs = inputs[::slice_gap]
-    trad_recons = trad_recons[::slice_gap]
-    dl_recons = dl_recons[::slice_gap]
-    slice_nums = slice_nums[::slice_gap]
-    
-    num_slices = len(inputs)
-    if num_slices == 0: return
-        
-    cols = 5
-    row_groups = math.ceil(num_slices / cols)
-    total_rows = row_groups * 3  
-    
-    fig, axes = plt.subplots(total_rows, cols, figsize=(3 * cols, 3 * total_rows),
-                             gridspec_kw={'wspace': 0.01, 'hspace': 0.01})
-    
-    # Ensure axes is always a 2D array for consistent indexing
-    if total_rows == 1: axes = axes[None, :]
-    if cols == 1: axes = axes[:, None]
-    
-    # CRITICAL: Turn off ALL axes globally first to handle empty subplots
-    for ax in axes.flatten():
-        ax.axis('off')
-        
-    for i in range(num_slices):
-        c = i % cols
-        r_group = i // cols
-        r_in, r_trad, r_dl = r_group * 3, r_group * 3 + 1, r_group * 3 + 2
-        
-        # Plotting
-        axes[r_in, c].imshow(inputs[i], cmap='gray')
-        axes[r_trad, c].imshow(trad_recons[i], cmap='gray')
-        axes[r_dl, c].imshow(dl_recons[i], cmap='gray')
-        
-        # Text Labels
-        axes[r_in, c].text(0.05, 0.95, f"{slice_nums[i]} (LR)", color='white', 
-                           fontsize=10, fontweight='bold', transform=axes[r_in, c].transAxes,
-                           va='top', ha='left')
-        axes[r_trad, c].text(0.05, 0.95, "Trad", color='cyan', 
-                             fontsize=10, fontweight='bold', transform=axes[r_trad, c].transAxes,
-                             va='top', ha='left')
-        axes[r_dl, c].text(0.05, 0.95, "DL", color='yellow', 
-                           fontsize=10, fontweight='bold', transform=axes[r_dl, c].transAxes,
-                           va='top', ha='left')
-
-    # Use bbox_inches='tight' to remove the extra white border around the figure
-    plt.savefig(save_path, bbox_inches='tight', pad_inches=0, dpi=300)
-    plt.close(fig)
-
-# ==========================================
-# 3. Real Scanner Dataset
-# ==========================================
-class SPENScannerDataset(Dataset):
-    def __init__(self, data_dir, input_key='Imag_low', trad_key='Image_SPEN'):
-        self.data_dir = data_dir
-        self.input_key, self.trad_key = input_key, trad_key
-        self.valid_files = glob.glob(os.path.join(data_dir, 'ratbrain_SPEN_96_*.mat'))
-        self.valid_files.sort(key=lambda x: int(re.search(r'_(\d+)\.mat', os.path.basename(x)).group(1)))
-
-    def __len__(self): return len(self.valid_files)
-
-    def __getitem__(self, idx):
-        f_path = self.valid_files[idx]
-        mat_data = scipy.io.loadmat(f_path)
-        
-        # Process Input: Magnitude -> Rotate -> Normalize
-        img_in = np.abs(np.squeeze(mat_data[self.input_key]))
-        img_in = np.rot90(img_in, k=2) # Align with training PNGs
-        img_in = (img_in - img_in.min()) / (img_in.max() - img_in.min() + 1e-8)
-        
-        # Process Trad: Magnitude -> Normalize
-        img_trad = np.abs(np.squeeze(mat_data[self.trad_key]))
-        img_trad = (img_trad - img_trad.min()) / (img_trad.max() - img_trad.min() + 1e-8)
-        
-        return torch.FloatTensor(img_in).unsqueeze(0), torch.FloatTensor(img_trad).unsqueeze(0), Path(f_path).stem
-
-# ==========================================
-# 4. Main Inference
-# ==========================================
-if __name__ == "__main__":
-    time_prefix = datetime.now().strftime("%m%d%H%M")
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataroot', type=str, default='/home/data1/musong/workspace/2026/03/17/spen_matlab/export_data/pv360')
-    parser.add_argument('--ckpt', type=str, default='/home/data1/musong/workspace/python/spen_recons/log/03251740_end_to_end_spen/ckpt/best.pth')
-    parser.add_argument('--log_dir', type=str, default=f'log/{time_prefix}_supervised_scanner_test')
-    opt = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(os.path.join(opt.log_dir, 'recons'), exist_ok=True)
-
-    # Load Model
-    model = SimpleUNet().to(device)
-    checkpoint = torch.load(opt.ckpt, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-
-    dataloader = DataLoader(SPENScannerDataset(opt.dataroot), batch_size=1, shuffle=False)
-    all_in, all_trad, all_dl, all_ids = [], [], [], []
-
-    print(f"[*] Testing {len(dataloader)} slices...")
-    with torch.no_grad():
-        for i, (img_in, img_trad, file_id) in enumerate(dataloader):
-            output = model(img_in.to(device))
-            
-            # Save individual PNG
-            save_image(output, os.path.join(opt.log_dir, 'recons', f"{file_id[0]}.png"))
-            
-            # Collect for grid
-            all_in.append(img_in.squeeze().numpy())
-            all_trad.append(img_trad.squeeze().numpy())
-            all_dl.append(output.cpu().squeeze().numpy())
-            match = re.search(r'_(\d+)$', file_id[0])
-            all_ids.append(match.group(1) if match else file_id[0])
-
-    plot_comparison_5xn(all_in, all_trad, all_dl, all_ids, os.path.join(opt.log_dir, "Scanner_Comparison_Grid.png"))
-    print(f"[+] Complete. Results in {opt.log_dir}")
-```
-
-My request is:
-test the scanner data use code1 trained model, whose path is `/home/data1/musong/workspace/python/spen_recons/log/04020855_spen_matrix_recons/ckpt/best.pth`, note that, img_trad is now the input when test!

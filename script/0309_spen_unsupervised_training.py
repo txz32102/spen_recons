@@ -171,12 +171,17 @@ def train(args):
     run_log_dir = os.path.join(args.log_dir, f"{timestamp}_{args.exp_name}")
     os.makedirs(run_log_dir, exist_ok=True)
     
+    # Create a checkpoints directory
+    ckpt_dir = os.path.join(run_log_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    
     logger = setup_logger(run_log_dir)
     
     # Log the parsed arguments
     logger.info(f"Starting experiment: {args.exp_name}")
     logger.info(f"Arguments: {vars(args)}")
     logger.info(f"Logs and images saved to: {run_log_dir}")
+    logger.info(f"Checkpoints will be saved to: {ckpt_dir}")
 
     # --- 1. Data Setup ---
     dt = SpenDataset(args.data_dir)
@@ -204,6 +209,9 @@ def train(args):
     ssim_metric = SSIM(data_range=data_range).to(device)
     
     spen_simulator = spen(acq_point=(96, 96), device=device)
+
+    # Tracker for the best model metric
+    best_test_psnr = -float('inf')
 
     # --- 3. Training Loop ---
     for epoch in range(args.epochs):
@@ -318,12 +326,30 @@ def train(args):
         avg_test_ssim = np.mean(test_ssim_list)
         std_test_ssim = np.std(test_ssim_list)
 
+        # -- CHECKPOINT SAVING --
+        # 1. Save last checkpoint
+        last_ckpt_path = os.path.join(ckpt_dir, "last_ckpt.pth")
+        torch.save(model.state_dict(), last_ckpt_path)
+
+        # 2. Save best checkpoint based on test PSNR
+        if avg_test_psnr > best_test_psnr:
+            best_test_psnr = avg_test_psnr
+            best_ckpt_path = os.path.join(ckpt_dir, "best_ckpt.pth")
+            torch.save(model.state_dict(), best_ckpt_path)
+            is_best = True
+        else:
+            is_best = False
+
         # -- LOGGING --
-        logger.info(
+        log_msg = (
             f"Epoch [{epoch+1:03d}/{args.epochs}] "
             f"TRAIN: Loss {avg_train_loss:.4f}, PSNR {avg_train_psnr:.2f}±{std_train_psnr:.2f}, SSIM {avg_train_ssim:.4f}±{std_train_ssim:.4f} | "
             f"TEST: Loss {avg_test_loss:.4f}, PSNR {avg_test_psnr:.2f}±{std_test_psnr:.2f}, SSIM {avg_test_ssim:.4f}±{std_test_ssim:.4f}"
         )
+        if is_best:
+            log_msg += f"  --> [Saved new best checkpoint]"
+            
+        logger.info(log_msg)
 
     logger.info("Training complete.")
 
