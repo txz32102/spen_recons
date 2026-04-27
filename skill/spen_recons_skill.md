@@ -3,7 +3,7 @@ A streamlined PyTorch framework for high-fidelity Spatiotemporal Encoding (SPEN)
 
 ## Caution
 
-!!!YOU DONT NEED TO READ ANY SCRIPT UNDER `/home/data1/musong/workspace/python/spen_recons/script`, AND THEY ARE OTHER RECONSTRUCTION SCRIPTS WHICH ARE UNNECESSARY!!! WHEN YOU WRITE A SCRIPT, IT SHOULD BE LOCATED UNDER `/home/data1/musong/workspace/python/spen_recons/script`.
+!!!YOU DONT NEED TO READ ANY SCRIPT UNDER `/home/data1/musong/workspace/python/spen_recons/script`, AND THEY ARE OTHER RECONSTRUCTION SCRIPTS WHICH ARE UNNECESSARY!!!
 
 ## Key Features
 * **Automated Logging:** Unique timestamped directories (`log/MMDDHHMM_project_name`) for collision-free experiment tracking.
@@ -24,7 +24,7 @@ source .venv/bin/activate
 export PYTHONPATH=$PYTHONPATH:.
 
 # Execute training (replace {date_script_name} with format like 0113)
-CUDA_VISIBLE_DEVICES=1 python3 script/{date_script_name}.py
+CUDA_VISIBLE_DEVICES=1 python3 {date_script_name}.py
 ```
 
 This should be written in the top of the python script.
